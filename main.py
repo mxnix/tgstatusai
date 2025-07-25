@@ -32,8 +32,8 @@ SSH_PORT = int(os.getenv("SSH_PORT", 22))
 SSH_USER = os.getenv("SSH_USER")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH")
 
-# --- Состояния для ConversationHandler ---
-RESTART_SERVICE, GET_LOG_PATH, KILL_PROCESS_PID = range(3)
+# --- Состояния для ConversationHandler (остались для рестарта и килла)---
+RESTART_SERVICE, KILL_PROCESS_PID = range(2)
 
 # --- Настройка логирования ---
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -54,7 +54,11 @@ def admin_only(func):
         user_id = update.effective_user.id
         if str(user_id) != ADMIN_USER_ID:
             logger.warning(f"Unauthorized access denied for {user_id}.")
-            await context.bot.send_message(chat_id=user_id, text="⛔️ Доступ запрещен.")
+            # Отвечаем в любом случае, чтобы пользователь знал о проблеме
+            if update.callback_query:
+                await update.callback_query.answer("⛔️ Доступ запрещен.", show_alert=True)
+            elif update.message:
+                await update.message.reply_text("⛔️ Доступ запрещен.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
@@ -97,7 +101,7 @@ def get_main_menu_keyboard():
 def get_management_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Рестарт службы", callback_data='restart_service_prompt')],
-        [InlineKeyboardButton("📜 Получить лог", callback_data='get_log_prompt')],
+        [InlineKeyboardButton("📜 Получить лог", callback_data='get_log_info')],
         [InlineKeyboardButton("📈 Топ процессов", callback_data='get_top_processes')],
         [InlineKeyboardButton("🔙 Назад", callback_data='main_menu')],
     ])
@@ -114,6 +118,10 @@ def get_back_keyboard(target='main_menu'):
 # --- Основные обработчики ---
 @admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Удаляем старые задачи дашборда при рестарте бота, если они есть
+    current_jobs = context.job_queue.get_jobs_by_name(str(update.effective_user.id))
+    for job in current_jobs: job.schedule_removal()
+    
     await update.message.reply_text(
         "👋 **Бот для мониторинга сервера**\n\nВыберите действие:",
         reply_markup=get_main_menu_keyboard(),
@@ -183,8 +191,9 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_jobs = context.job_queue.get_jobs_by_name(str(query.from_user.id))
     for job in current_jobs: job.schedule_removal()
     message = await query.edit_message_text("⏳ Запускаю дашборд...")
+    # ИСПРАВЛЕНО: Добавлен `first=0.1` для мгновенного запуска
     context.job_queue.run_repeating(
-        update_dashboard_job, 10,
+        update_dashboard_job, interval=10, first=0.1,
         chat_id=query.from_user.id,
         data={'message_id': message.message_id},
         name=str(query.from_user.id)
@@ -195,7 +204,8 @@ async def dashboard_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     current_jobs = context.job_queue.get_jobs_by_name(str(query.from_user.id))
-    for job in current_jobs: job.schedule_removal()
+    for job in current_jobs:
+        job.schedule_removal()
     await query.delete_message()
 
 # --- Сводка по серверу (Neofetch) ---
@@ -205,52 +215,22 @@ async def get_server_summary(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     await query.edit_message_text("⏳ Собираю сводку по серверу...")
 
-    # Оптимизированная команда для сбора всех данных за один раз
     command = "cat /etc/os-release | grep PRETTY_NAME | cut -d'\"' -f2; " \
               "hostname; " \
               "uptime -p; " \
               "grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | sed 's/^ *//'; " \
               "free -h | awk '/^Mem:/ {print $3\" / \"$2}'; " \
               "df -h / | awk 'NR==2 {print $3\" / \"$2\" (\"$5\")\"}'"
-    
     output = await execute_ssh_command(command)
     
     try:
         os_name, host, uptime, cpu, ram, disk = output.split('\n')
-        
-        # ASCII-арт и данные
-        art = [
-            "      .--.     ",
-            "     |o_o |    ",
-            "     |:_/ |    ",
-            "    //   \ \   ",
-            "   (|     | )  ",
-            "  /'\_   _/`\  ",
-            "  \___)=(___/  "
-        ]
-        
-        data = [
-            f"OS:      {os_name}",
-            f"Host:    {host}",
-            f"Uptime:  {uptime}",
-            f"CPU:     {cpu}",
-            f"RAM:     {ram}",
-            f"Disk:    {disk}",
-            ""
-        ]
-
-        # Собираем все в одну строку
-        result = []
-        for i in range(len(art)):
-            result.append(art[i] + data[i])
-        
+        art = ["      .--.     ", "     |o_o |    ", "     |:_/ |    ", "    //   \ \   ", "   (|     | )  ", "  /'\_   _/`\  ", "  \___)=(___/  "]
+        data = [f"OS:      {os_name}", f"Host:    {host}", f"Uptime:  {uptime}", f"CPU:     {cpu}", f"RAM:     {ram}", f"Disk:    {disk}", ""]
+        result = [art[i] + data[i] for i in range(len(art))]
         formatted_output = "\n".join(result)
         
-        await query.edit_message_text(
-            f"ℹ️ **Сводка по серверу**\n\n<pre>{formatted_output}</pre>",
-            reply_markup=get_back_keyboard(),
-            parse_mode=ParseMode.HTML
-        )
+        await query.edit_message_text(f"ℹ️ **Сводка по серверу**\n\n<pre>{formatted_output}</pre>", reply_markup=get_back_keyboard(), parse_mode=ParseMode.HTML)
     except Exception as e:
         logger.error(f"Failed to create summary: {e}. Output: {output}")
         await query.edit_message_text("❌ Не удалось создать сводку. Проверьте логи.", reply_markup=get_back_keyboard())
@@ -315,28 +295,64 @@ async def kill_process_execute(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(text, reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.HTML)
 
 # --- Логи и Рестарт ---
-async def get_log_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ИСПРАВЛЕНО: Команда /logs теперь обрабатывается напрямую
+@admin_only
+async def get_log_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает инструкцию по использованию команды /logs."""
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("📜 **Получение лога**\n\nВведите полный путь к лог-файлу.", reply_markup=get_back_keyboard('open_management_menu'))
-    return GET_LOG_PATH
+    await query.edit_message_text(
+        "📜 **Получение лога**\n\n"
+        "Используйте команду `/logs`, чтобы получить файл с логами.\n\n"
+        "**Формат:**\n`/logs [кол-во строк] [путь к файлу]`\n\n"
+        "**Примеры:**\n`/logs 500 /var/log/nginx/access.log`\n"
+        "`/logs /var/log/syslog` (вернет 200 строк по умолчанию)",
+        reply_markup=get_back_keyboard('open_management_menu'),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def send_log_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_path = update.message.text
-    msg = await update.message.reply_text(f"⏳ Собираю лог `{log_path}`...", parse_mode=ParseMode.MARKDOWN)
-    output = await execute_ssh_command(f"tail -n 200 {log_path}")
+@admin_only
+async def view_logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет файл с указанным количеством строк лога."""
+    args = context.args
+    lines = 200
+    log_path = ""
+
+    if len(args) == 1:
+        log_path = args[0]
+    elif len(args) >= 2 and args[0].isdigit():
+        lines = int(args[0])
+        log_path = " ".join(args[1:])
+    else:
+        await update.message.reply_text(
+            "⚠️ **Неверный формат команды.**\n\n"
+            "**Формат:** `/logs [кол-во строк] [путь]`\n"
+            "**Пример:** `/logs 500 /var/log/syslog`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    msg = await update.message.reply_text(f"⏳ Собираю последние {lines} строк из `{log_path}`...", parse_mode=ParseMode.MARKDOWN)
+    output = await execute_ssh_command(f"tail -n {lines} {log_path}")
+
     if "Ошибка" in output or "No such file" in output or not output:
-        await msg.edit_text(f"❌ Не удалось получить лог.\n`{output}`", reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.MARKDOWN)
-        return ConversationHandler.END
+        await msg.edit_text(f"❌ Не удалось получить лог.\n`{output}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
     temp_filename = ""
     try:
         temp_filename = f"{os.path.basename(log_path)}_{uuid.uuid4()}.log"
         with open(temp_filename, "w", encoding="utf-8") as f: f.write(output)
-        with open(temp_filename, "rb") as f: await context.bot.send_document(chat_id=update.effective_chat.id, document=f, caption=f"📋 Лог `{log_path}`", parse_mode=ParseMode.MARKDOWN)
+        with open(temp_filename, "rb") as f:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=f,
+                caption=f"📋 Вот последние {lines} строк из лога `{log_path}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
         await msg.delete()
     finally:
         if temp_filename and os.path.exists(temp_filename): os.remove(temp_filename)
-    return ConversationHandler.END
 
 async def restart_service_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -364,9 +380,8 @@ async def restart_service_execute(update: Update, context: ContextTypes.DEFAULT_
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
+    # --- Handlers ---
     conv_handlers = {
-        "log": ConversationHandler(entry_points=[CallbackQueryHandler(get_log_prompt, '^get_log_prompt$')], states={GET_LOG_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_log_file)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
         "restart": ConversationHandler(entry_points=[CallbackQueryHandler(restart_service_prompt, '^restart_service_prompt$')], states={RESTART_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, restart_service_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
         "kill": ConversationHandler(entry_points=[CallbackQueryHandler(kill_process_prompt, '^kill_process_prompt$')], states={KILL_PROCESS_PID: [MessageHandler(filters.TEXT & ~filters.COMMAND, kill_process_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
     }
@@ -379,19 +394,22 @@ def main():
         '^get_network_info$': get_network_info,
         '^run_speedtest$': run_speedtest,
         '^get_top_processes$': get_top_processes,
+        '^get_log_info$': get_log_info, # ИСПРАВЛЕНО: Кнопка логов теперь вызывает инструкцию
         '^restart_service_yes$': restart_service_execute,
         '^kill_process_yes$': kill_process_execute,
     }
     
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("logs", view_logs_command)) # ИСПРАВЛЕНО: Новый обработчик для /logs
+
     for pattern, handler in callback_handlers.items():
         application.add_handler(CallbackQueryHandler(handler, pattern=pattern))
     for handler in conv_handlers.values():
         application.add_handler(handler)
 
-    logger.info("Bot started with Neofetch-style UI...")
+    logger.info("Bot started with new interactive UI...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
-
+        
