@@ -1,0 +1,9 @@
+# Environments
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+*.egg-info/
+
