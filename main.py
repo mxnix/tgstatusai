@@ -31,8 +31,12 @@ SSH_HOST = os.getenv("SSH_HOST")
 SSH_PORT = int(os.getenv("SSH_PORT", 22))
 SSH_USER = os.getenv("SSH_USER")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH")
+CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", 90.0))
+RAM_THRESHOLD = float(os.getenv("RAM_THRESHOLD", 90.0))
+DISK_THRESHOLD = float(os.getenv("DISK_THRESHOLD", 95.0))
 
-# --- Состояния для ConversationHandler (остались для рестарта и килла)---
+
+# --- Состояния для ConversationHandler ---
 RESTART_SERVICE, KILL_PROCESS_PID = range(2)
 
 # --- Настройка логирования ---
@@ -54,7 +58,6 @@ def admin_only(func):
         user_id = update.effective_user.id
         if str(user_id) != ADMIN_USER_ID:
             logger.warning(f"Unauthorized access denied for {user_id}.")
-            # Отвечаем в любом случае, чтобы пользователь знал о проблеме
             if update.callback_query:
                 await update.callback_query.answer("⛔️ Доступ запрещен.", show_alert=True)
             elif update.message:
@@ -118,7 +121,6 @@ def get_back_keyboard(target='main_menu'):
 # --- Основные обработчики ---
 @admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Удаляем старые задачи дашборда при рестарте бота, если они есть
     current_jobs = context.job_queue.get_jobs_by_name(str(update.effective_user.id))
     for job in current_jobs: job.schedule_removal()
     
@@ -191,7 +193,6 @@ async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_jobs = context.job_queue.get_jobs_by_name(str(query.from_user.id))
     for job in current_jobs: job.schedule_removal()
     message = await query.edit_message_text("⏳ Запускаю дашборд...")
-    # ИСПРАВЛЕНО: Добавлен `first=0.1` для мгновенного запуска
     context.job_queue.run_repeating(
         update_dashboard_job, interval=10, first=0.1,
         chat_id=query.from_user.id,
@@ -295,10 +296,8 @@ async def kill_process_execute(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(text, reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.HTML)
 
 # --- Логи и Рестарт ---
-# ИСПРАВЛЕНО: Команда /logs теперь обрабатывается напрямую
 @admin_only
 async def get_log_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает инструкцию по использованию команды /logs."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
@@ -313,7 +312,6 @@ async def get_log_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def view_logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет файл с указанным количеством строк лога."""
     args = context.args
     lines = 200
     log_path = ""
@@ -376,6 +374,45 @@ async def restart_service_execute(update: Update, context: ContextTypes.DEFAULT_
     text = f"✅ Служба `{service_name}` успешно перезапущена." if "OK" in output else f"❌ Не удалось перезапустить службу `{service_name}`.\n<pre>{output}</pre>"
     await query.edit_message_text(text, reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.HTML)
 
+# --- Фоновые задачи (Автомониторинг) ---
+# Эти функции не вызываются напрямую, а работают в фоне через job_queue
+async def check_server_availability(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет доступность сервера по SSH."""
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        private_key = paramiko.RSAKey.from_private_key_file(SSH_KEY_PATH)
+        await asyncio.to_thread(
+             ssh.connect, SSH_HOST, port=SSH_PORT, username=SSH_USER, pkey=private_key, timeout=10
+        )
+        ssh.close()
+        logger.info("Availability check: Server is UP.")
+    except Exception as e:
+        logger.error(f"Availability check: Server is DOWN. Error: {e}")
+        await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"🚨 ВНИМАНИЕ! Сервер {SSH_HOST} недоступен! Ошибка: {e}")
+
+async def check_thresholds(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет пороговые значения ресурсов."""
+    try:
+        cpu_cmd = "top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\\([0-9.]*\\)%* id.*/\\1/' | awk '{print 100 - $1}'"
+        ram_cmd = "free | grep Mem | awk '{print $3/$2 * 100.0}'"
+        disk_cmd = "df / | tail -n 1 | awk '{print $5}' | sed 's/%//'"
+        
+        cpu_usage = float(await execute_ssh_command(cpu_cmd))
+        if cpu_usage > CPU_THRESHOLD:
+            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Нагрузка CPU превысила порог: {cpu_usage:.2f}% (Порог: {CPU_THRESHOLD}%)")
+
+        ram_usage = float(await execute_ssh_command(ram_cmd))
+        if ram_usage > RAM_THRESHOLD:
+            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Использование RAM превысило порог: {ram_usage:.2f}% (Порог: {RAM_THRESHOLD}%)")
+
+        disk_usage = float(await execute_ssh_command(disk_cmd))
+        if disk_usage > DISK_THRESHOLD:
+            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Место на диске превысило порог: {disk_usage:.2f}% (Порог: {DISK_THRESHOLD}%)")
+    except Exception as e:
+        logger.error(f"Could not check thresholds. Error: {e}")
+
+
 # --- Основная функция ---
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -386,30 +423,4 @@ def main():
         "kill": ConversationHandler(entry_points=[CallbackQueryHandler(kill_process_prompt, '^kill_process_prompt$')], states={KILL_PROCESS_PID: [MessageHandler(filters.TEXT & ~filters.COMMAND, kill_process_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
     }
     callback_handlers = {
-        '^main_menu$': main_menu,
-        '^open_management_menu$': open_management_menu,
-        '^dashboard_start$': dashboard_start,
-        '^dashboard_stop$': dashboard_stop,
-        '^get_summary$': get_server_summary,
-        '^get_network_info$': get_network_info,
-        '^run_speedtest$': run_speedtest,
-        '^get_top_processes$': get_top_processes,
-        '^get_log_info$': get_log_info, # ИСПРАВЛЕНО: Кнопка логов теперь вызывает инструкцию
-        '^restart_service_yes$': restart_service_execute,
-        '^kill_process_yes$': kill_process_execute,
-    }
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("logs", view_logs_command)) # ИСПРАВЛЕНО: Новый обработчик для /logs
-
-    for pattern, handler in callback_handlers.items():
-        application.add_handler(CallbackQueryHandler(handler, pattern=pattern))
-    for handler in conv_handlers.values():
-        application.add_handler(handler)
-
-    logger.info("Bot started with new interactive UI...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
-        
+      
