@@ -423,4 +423,34 @@ def main():
         "kill": ConversationHandler(entry_points=[CallbackQueryHandler(kill_process_prompt, '^kill_process_prompt$')], states={KILL_PROCESS_PID: [MessageHandler(filters.TEXT & ~filters.COMMAND, kill_process_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
     }
     callback_handlers = {
-      
+        '^main_menu$': main_menu,
+        '^open_management_menu$': open_management_menu,
+        '^dashboard_start$': dashboard_start,
+        '^dashboard_stop$': dashboard_stop,
+        '^get_summary$': get_server_summary,
+        '^get_network_info$': get_network_info,
+        '^run_speedtest$': run_speedtest,
+        '^get_top_processes$': get_top_processes,
+        '^get_log_info$': get_log_info,
+        '^restart_service_yes$': restart_service_execute,
+        '^kill_process_yes$': kill_process_execute,
+    }
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("logs", view_logs_command))
+
+    for pattern, handler in callback_handlers.items():
+        application.add_handler(CallbackQueryHandler(handler, pattern=pattern))
+    for handler in conv_handlers.values():
+        application.add_handler(handler)
+
+    # --- Настройка фоновых задач ---
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_server_availability, interval=120, first=15) 
+    job_queue.run_repeating(check_thresholds, interval=600, first=30)
+
+    logger.info("Bot started with new interactive UI and background monitoring...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
