@@ -8,57 +8,59 @@ from functools import wraps
 
 import paramiko
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
-# Загрузка переменных окружения из .env файла
+# --- Загрузка и настройка ---
 load_dotenv()
 
-# --- Константы из .env ---
+# --- Константы ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 SSH_HOST = os.getenv("SSH_HOST")
 SSH_PORT = int(os.getenv("SSH_PORT", 22))
 SSH_USER = os.getenv("SSH_USER")
 SSH_KEY_PATH = os.getenv("SSH_KEY_PATH")
-CPU_THRESHOLD = float(os.getenv("CPU_THRESHOLD", 90.0))
-RAM_THRESHOLD = float(os.getenv("RAM_THRESHOLD", 90.0))
-DISK_THRESHOLD = float(os.getenv("DISK_THRESHOLD", 95.0))
 
-# --- Настройка логирования в файл и консоль ---
+# --- Состояния для ConversationHandler ---
+RESTART_SERVICE, GET_LOG_PATH, KILL_PROCESS_PID = range(3)
+
+# --- Настройка логирования ---
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# Обработчик для записи в файл (bot.log), с ротацией
 file_handler = RotatingFileHandler('bot.log', maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
 file_handler.setFormatter(log_formatter)
-# Обработчик для вывода в консоль
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
-# Получаем корневой логгер и добавляем ему обработчики
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
-# --- Состояния для автомониторинга ---
-server_unreachable = False
-threshold_alerts = {"cpu": False, "ram": False, "disk": False}
-
-# --- Декоратор для проверки прав администратора ---
+# --- Декоратор для проверки прав ---
 def admin_only(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        if str(update.effective_user.id) != ADMIN_USER_ID:
-            logger.warning(f"Unauthorized access denied for {update.effective_user.id}.")
-            await update.message.reply_text("⛔️ Доступ запрещен.")
+        user_id = update.effective_user.id
+        if str(user_id) != ADMIN_USER_ID:
+            logger.warning(f"Unauthorized access denied for {user_id}.")
+            await context.bot.send_message(chat_id=user_id, text="⛔️ Доступ запрещен.")
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- Основная функция для выполнения SSH команд ---
+# --- SSH и вспомогательные функции ---
 async def execute_ssh_command(command: str) -> str:
-    """Подключается к серверу Б по SSH и выполняет команду."""
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -76,272 +78,320 @@ async def execute_ssh_command(command: str) -> str:
         return output
     except Exception as e:
         logger.error(f"SSH connection or command failed: {e}")
-        return f"🚨 Не удалось подключиться к серверу {SSH_HOST} или выполнить команду. Ошибка: {e}"
+        return f"🚨 Не удалось подключиться к серверу или выполнить команду. Ошибка: {e}"
 
-# --- Вспомогательные функции и команды бота ---
-def create_progress_bar(percentage: float, length: int = 10) -> str:
-    """Создает текстовый прогресс-бар. Пример: [█████-----] 50.0% """
-    if not 0 <= percentage <= 100:
-        percentage = 0
-    filled_length = int(length * percentage // 100)
-    bar = '█' * filled_length + '─' * (length - filled_length)
-    return f"[{bar}] {percentage:.1f}%"
+# --- Клавиатуры ---
+def get_main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Дашборд", callback_data='dashboard_start'),
+            InlineKeyboardButton("ℹ️ Сводка", callback_data='get_summary'),
+        ],
+        [InlineKeyboardButton("⚙️ Управление", callback_data='open_management_menu')],
+        [
+            InlineKeyboardButton("🚀 SpeedTest", callback_data='run_speedtest'),
+            InlineKeyboardButton("🔌 Сеть", callback_data='get_network_info'),
+        ],
+    ])
 
+def get_management_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Рестарт службы", callback_data='restart_service_prompt')],
+        [InlineKeyboardButton("📜 Получить лог", callback_data='get_log_prompt')],
+        [InlineKeyboardButton("📈 Топ процессов", callback_data='get_top_processes')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='main_menu')],
+    ])
+
+def get_top_processes_keyboard(back_target='open_management_menu'):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💀 Завершить процесс", callback_data='kill_process_prompt')],
+        [InlineKeyboardButton("🔙 Назад", callback_data=back_target)],
+    ])
+
+def get_back_keyboard(target='main_menu'):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data=target)]])
+
+# --- Основные обработчики ---
 @admin_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет приветственное сообщение и клавиатуру с командами."""
-    keyboard = [
-        [KeyboardButton("📊 Ресурсы"), KeyboardButton("💾 Диски")],
-        [KeyboardButton("ℹ️ Инфо о сервере"), KeyboardButton("🚀 SpeedTest")],
-        [KeyboardButton("🔌 Сеть"), KeyboardButton("📜 Логи (/logs)"), KeyboardButton("⚙️ Рестарт (/restart)")],
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Я ваш бот для мониторинга сервера.\n"
-        "Выберите команду на клавиатуре или введите вручную.",
-        reply_markup=reply_markup
+        "👋 **Бот для мониторинга сервера**\n\nВыберите действие:",
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
     )
 
 @admin_only
-async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает текстовые команды с клавиатуры."""
-    text = update.message.text
-    action_map = {
-        "📊 Ресурсы": get_resources,
-        "💾 Диски": get_disk_space,
-        "ℹ️ Инфо о сервере": get_server_info,
-        "🚀 SpeedTest": run_speedtest,
-        "🔌 Сеть": get_network_info,
-    }
-    if text in action_map:
-        await action_map[text](update, context)
-    elif text == "📜 Логи (/logs)":
-         await update.message.reply_text("Используйте: `/logs [путь_к_логу]`", parse_mode=ParseMode.MARKDOWN)
-    elif text == "⚙️ Рестарт (/restart)":
-         await update.message.reply_text("Используйте: `/restart [служба]`", parse_mode=ParseMode.MARKDOWN)
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "👋 **Бот для мониторинга сервера**\n\nВыберите действие:",
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 @admin_only
-async def ping_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручная PING-проверка."""
-    await update.message.reply_text("🏓 Понг! Бот активен. Проверяю доступность сервера...")
-    response = await execute_ssh_command("echo 'OK'")
-    if "OK" in response:
-        await update.message.reply_text(f"✅ Сервер **{SSH_HOST}** доступен.", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+async def open_management_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "⚙️ **Меню управления**",
+        reply_markup=get_management_menu_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-@admin_only
-async def get_resources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает загрузку CPU и RAM с красивыми индикаторами."""
-    await update.message.reply_text("⏳ Собираю данные о ресурсах...")
-    ram_cmd = "free | awk 'NR==2{printf \"%.1f\", $3/$2*100}'"
-    cpu_cmd = "uptime | awk -F'load average: ' '{print $2}'"
-    ram_percent_str = await execute_ssh_command(ram_cmd)
-    cpu_load_avg = await execute_ssh_command(cpu_cmd)
+# --- Дашборд ---
+async def update_dashboard_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
     try:
-        ram_percent = float(ram_percent_str)
-        ram_bar = create_progress_bar(ram_percent)
-        response = (
-            f"📊 **Использование ресурсов**\n\n"
+        ram_cmd = "free -b | awk 'NR==2{printf \"%.1f\", $3/$2*100}'"
+        cpu_cmd = "uptime | awk -F'load average: ' '{print $2}'"
+        disk_cmd = "df -h / | awk 'NR==2{print $5}'"
+        
+        ram_percent = float(await execute_ssh_command(ram_cmd))
+        cpu_load = (await execute_ssh_command(cpu_cmd)).strip()
+        disk_usage = (await execute_ssh_command(disk_cmd)).strip()
+
+        ram_bar = f"[{'█' * int(ram_percent / 10) + '─' * (10 - int(ram_percent / 10))}] {ram_percent:.1f}%"
+        
+        text = (
+            f"📊 **Дашборд (обновляется каждые 10 сек)**\n\n"
             f"🧠 **RAM:** {ram_bar}\n"
-            f"💻 **CPU Load Average:** `{cpu_load_avg.strip()}`"
+            f"💻 **CPU Load:** `{cpu_load}`\n"
+            f"💾 **Диск (корень):** `{disk_usage}` занято"
         )
-        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
-    except (ValueError, TypeError) as e:
-        logger.error(f"Failed to parse resources. RAM: '{ram_percent_str}', CPU: '{cpu_load_avg}'. Error: {e}")
-        await update.message.reply_text("❌ Не удалось разобрать данные о ресурсах с сервера.")
+        await context.bot.edit_message_text(
+            chat_id=job.chat_id,
+            message_id=job.data['message_id'],
+            text=text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть", callback_data='dashboard_stop')]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except BadRequest as e:
+        if "Message is not modified" in str(e): pass
+        else:
+            logger.error(f"Dashboard update error: {e}")
+            job.schedule_removal()
+    except Exception as e:
+        logger.error(f"Dashboard job failed: {e}")
+        job.schedule_removal()
 
 @admin_only
-async def get_disk_space(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает место на дисках."""
-    await update.message.reply_text("⏳ Получаю данные о дисках...")
-    command = "df -h"
-    output = await execute_ssh_command(command)
-    response = f"💾 **Место на дисках**\n\n<pre>{output}</pre>"
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+async def dashboard_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current_jobs = context.job_queue.get_jobs_by_name(str(query.from_user.id))
+    for job in current_jobs: job.schedule_removal()
+    message = await query.edit_message_text("⏳ Запускаю дашборд...")
+    context.job_queue.run_repeating(
+        update_dashboard_job, 10,
+        chat_id=query.from_user.id,
+        data={'message_id': message.message_id},
+        name=str(query.from_user.id)
+    )
 
 @admin_only
-async def get_server_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выводит общую информацию о сервере."""
-    await update.message.reply_text("⏳ Получаю информацию о сервере...")
-    command = "hostname && lsb_release -d -s && uptime -p"
+async def dashboard_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    current_jobs = context.job_queue.get_jobs_by_name(str(query.from_user.id))
+    for job in current_jobs: job.schedule_removal()
+    await query.delete_message()
+
+# --- Сводка по серверу (Neofetch) ---
+@admin_only
+async def get_server_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏳ Собираю сводку по серверу...")
+
+    # Оптимизированная команда для сбора всех данных за один раз
+    command = "cat /etc/os-release | grep PRETTY_NAME | cut -d'\"' -f2; " \
+              "hostname; " \
+              "uptime -p; " \
+              "grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | sed 's/^ *//'; " \
+              "free -h | awk '/^Mem:/ {print $3\" / \"$2}'; " \
+              "df -h / | awk 'NR==2 {print $3\" / \"$2\" (\"$5\")\"}'"
+    
     output = await execute_ssh_command(command)
+    
     try:
-        hostname, os_version, uptime = output.split('\n')
-        response = (
-            f"ℹ️ **Информация о сервере**\n\n"
-            f"Сервер: `{hostname}`\n"
-            f"ОС: `{os_version}`\n"
-            f"Аптайм: `{uptime}`"
+        os_name, host, uptime, cpu, ram, disk = output.split('\n')
+        
+        # ASCII-арт и данные
+        art = [
+            "      .--.     ",
+            "     |o_o |    ",
+            "     |:_/ |    ",
+            "    //   \ \   ",
+            "   (|     | )  ",
+            "  /'\_   _/`\  ",
+            "  \___)=(___/  "
+        ]
+        
+        data = [
+            f"OS:      {os_name}",
+            f"Host:    {host}",
+            f"Uptime:  {uptime}",
+            f"CPU:     {cpu}",
+            f"RAM:     {ram}",
+            f"Disk:    {disk}",
+            ""
+        ]
+
+        # Собираем все в одну строку
+        result = []
+        for i in range(len(art)):
+            result.append(art[i] + data[i])
+        
+        formatted_output = "\n".join(result)
+        
+        await query.edit_message_text(
+            f"ℹ️ **Сводка по серверу**\n\n<pre>{formatted_output}</pre>",
+            reply_markup=get_back_keyboard(),
+            parse_mode=ParseMode.HTML
         )
-        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
-    except ValueError:
-        await update.message.reply_text(f"Не удалось разобрать ответ от сервера:\n<pre>{output}</pre>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Failed to create summary: {e}. Output: {output}")
+        await query.edit_message_text("❌ Не удалось создать сводку. Проверьте логи.", reply_markup=get_back_keyboard())
+
+# --- Другие команды ---
+@admin_only
+async def get_network_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏳ Получаю сетевую информацию...")
+    output = await execute_ssh_command("ss -tulnp")
+    await query.edit_message_text(f"🔌 **Активные сетевые подключения**\n\n<pre>{output}</pre>", reply_markup=get_back_keyboard(), parse_mode=ParseMode.HTML)
 
 @admin_only
 async def run_speedtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает SpeedTest и выводит результат в красивом виде."""
-    await update.message.reply_text("🚀 Запускаю SpeedTest... Это может занять до минуты.")
-    command = "speedtest-cli --simple"
-    output = await execute_ssh_command(command)
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🚀 Запускаю SpeedTest... Это может занять до минуты.")
+    output = await execute_ssh_command("speedtest-cli --simple")
     try:
         ping = re.search(r"Ping: ([\d.]+) ms", output).group(1)
         download = re.search(r"Download: ([\d.]+) Mbit/s", output).group(1)
         upload = re.search(r"Upload: ([\d.]+) Mbit/s", output).group(1)
-        response = (
-            f"🌐 **Результаты SpeedTest**\n\n"
-            f"**Ping:** `{ping} ms`\n"
-            f"**Download:** `↓ {download} Mbit/s`\n"
-            f"**Upload:** `↑ {upload} Mbit/s`"
-        )
-        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        text = f"🌐 **Результаты SpeedTest**\n\n**Ping:** `{ping} ms`\n**Download:** `↓ {download} Mbit/s`\n**Upload:** `↑ {upload} Mbit/s`"
+        await query.edit_message_text(text, reply_markup=get_back_keyboard(), parse_mode=ParseMode.MARKDOWN)
     except AttributeError:
-        logger.warning(f"Could not parse SpeedTest output. Sending raw. Output: {output}")
-        response = f"🌐 **Результат SpeedTest (raw)**\n\n<pre>{output}</pre>"
-        await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+        await query.edit_message_text(f"🌐 **Результат SpeedTest (raw)**\n\n<pre>{output}</pre>", reply_markup=get_back_keyboard(), parse_mode=ParseMode.HTML)
 
+# --- Управление процессами ---
 @admin_only
-async def restart_service(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перезапускает указанную службу."""
-    service_name = " ".join(context.args)
-    if not service_name:
-        await update.message.reply_text("⚠️ Укажите имя службы. Пример: `/restart nginx`")
-        return
-    await update.message.reply_text(f"⚙️ Пытаюсь перезапустить службу `{service_name}`...")
-    command = f"sudo systemctl restart {service_name} && echo 'OK'"
+async def get_top_processes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("⏳ Получаю список процессов...")
+    command = "ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -n 11"
     output = await execute_ssh_command(command)
-    if "OK" in output:
-        response = f"✅ Служба `{service_name}` успешно перезапущена."
-    else:
-        response = f"❌ Не удалось перезапустить службу `{service_name}`.\n\n<pre>{output}</pre>"
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+    await query.edit_message_text(f"📈 **Топ процессов по CPU**\n\n<pre>{output}</pre>", reply_markup=get_top_processes_keyboard(), parse_mode=ParseMode.HTML)
 
-@admin_only
-async def view_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Собирает лог, упаковывает в файл и отправляет его."""
-    log_path = " ".join(context.args)
-    if not log_path:
-        await update.message.reply_text("⚠️ Укажите путь к лог-файлу.\n*Пример:* `/logs /var/log/syslog`", parse_mode=ParseMode.MARKDOWN)
-        return
-    await update.message.reply_text(f"⏳ Собираю лог `{log_path}` и готовлю файл...", parse_mode=ParseMode.MARKDOWN)
-    command = f"tail -n 200 {log_path}"
-    output = await execute_ssh_command(command)
-    if "Ошибка выполнения" in output or not output or "No such file" in output:
-        await update.message.reply_text(f"❌ Не удалось получить лог.\nСервер ответил: `{output}`", parse_mode=ParseMode.MARKDOWN)
-        return
+async def kill_process_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("💀 **Завершение процесса**\n\nВведите PID процесса, который нужно завершить.", reply_markup=get_back_keyboard('open_management_menu'))
+    return KILL_PROCESS_PID
+
+async def kill_process_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pid = update.message.text
+    if not pid.isdigit():
+        await update.message.reply_text("Это не похоже на PID. Введите только цифры.", reply_markup=get_back_keyboard('open_management_menu'))
+        return KILL_PROCESS_PID
+    context.user_data['pid_to_kill'] = pid
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Да, завершить PID {pid}", callback_data=f'kill_process_yes')], [InlineKeyboardButton("❌ Отмена", callback_data='open_management_menu')]])
+    await update.message.reply_text(f"Вы уверены, что хотите завершить процесс с PID `{pid}`?", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def kill_process_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    pid = context.user_data.get('pid_to_kill')
+    await query.answer()
+    await query.edit_message_text(f"⏳ Завершаю процесс {pid}...")
+    output = await execute_ssh_command(f"kill {pid} && echo 'OK'")
+    text = f"✅ Процесс с PID `{pid}` успешно завершен." if "OK" in output else f"❌ Не удалось завершить процесс `{pid}`.\n<pre>{output}</pre>"
+    await query.edit_message_text(text, reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.HTML)
+
+# --- Логи и Рестарт ---
+async def get_log_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📜 **Получение лога**\n\nВведите полный путь к лог-файлу.", reply_markup=get_back_keyboard('open_management_menu'))
+    return GET_LOG_PATH
+
+async def send_log_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log_path = update.message.text
+    msg = await update.message.reply_text(f"⏳ Собираю лог `{log_path}`...", parse_mode=ParseMode.MARKDOWN)
+    output = await execute_ssh_command(f"tail -n 200 {log_path}")
+    if "Ошибка" in output or "No such file" in output or not output:
+        await msg.edit_text(f"❌ Не удалось получить лог.\n`{output}`", reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
     temp_filename = ""
     try:
         temp_filename = f"{os.path.basename(log_path)}_{uuid.uuid4()}.log"
-        with open(temp_filename, "w", encoding="utf-8") as log_file:
-            log_file.write(output)
-        with open(temp_filename, "rb") as log_file_to_send:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=log_file_to_send,
-                filename=f"{os.path.basename(log_path)}.log",
-                caption=f"📋 Вот последние 200 строк из лога `{log_path}`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    except Exception as e:
-        logger.error(f"Failed to send log file: {e}")
-        await update.message.reply_text(f"❌ Произошла ошибка при создании или отправке файла лога: {e}")
+        with open(temp_filename, "w", encoding="utf-8") as f: f.write(output)
+        with open(temp_filename, "rb") as f: await context.bot.send_document(chat_id=update.effective_chat.id, document=f, caption=f"📋 Лог `{log_path}`", parse_mode=ParseMode.MARKDOWN)
+        await msg.delete()
     finally:
-        if temp_filename and os.path.exists(temp_filename):
-            os.remove(temp_filename)
+        if temp_filename and os.path.exists(temp_filename): os.remove(temp_filename)
+    return ConversationHandler.END
 
-@admin_only
-async def get_network_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает активные сетевые подключения и порты."""
-    await update.message.reply_text("⏳ Получаю сетевую информацию...")
-    command = "ss -tulnp"
-    output = await execute_ssh_command(command)
-    response = f"🔌 **Активные сетевые подключения (TCP/UDP)**\n\n<pre>{output}</pre>"
-    await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+async def restart_service_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🔄 **Перезапуск службы**\n\nВведите имя службы (например, `nginx`).", reply_markup=get_back_keyboard('open_management_menu'))
+    return RESTART_SERVICE
 
-# --- Фоновые задачи (Автомониторинг) ---
-async def check_server_availability(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет доступность сервера по SSH."""
-    global server_unreachable
-    try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        private_key = paramiko.RSAKey.from_private_key_file(SSH_KEY_PATH)
-        await asyncio.to_thread(
-             ssh.connect, SSH_HOST, port=SSH_PORT, username=SSH_USER, pkey=private_key, timeout=10
-        )
-        ssh.close()
-        if server_unreachable:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"✅ Восстановлено соединение с сервером {SSH_HOST}!")
-            server_unreachable = False
-        logger.info("Availability check: Server is UP.")
-    except Exception as e:
-        if not server_unreachable:
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"🚨 ВНИМАНИЕ! Сервер {SSH_HOST} недоступен! Ошибка: {e}")
-            server_unreachable = True
-        logger.error(f"Availability check: Server is DOWN. Error: {e}")
+async def restart_service_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    service_name = update.message.text.strip()
+    context.user_data['service_to_restart'] = service_name
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Да, перезапустить {service_name}", callback_data=f'restart_service_yes')], [InlineKeyboardButton("❌ Отмена", callback_data='open_management_menu')]])
+    await update.message.reply_text(f"Вы уверены, что хотите перезапустить службу `{service_name}`?", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
 
-async def check_thresholds(context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет пороговые значения ресурсов."""
-    global threshold_alerts
-    if server_unreachable:
-        return
-    # Проверка CPU, RAM, Disk
-    cpu_cmd = "top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\\([0-9.]*\\)%* id.*/\\1/' | awk '{print 100 - $1}'"
-    ram_cmd = "free | grep Mem | awk '{print $3/$2 * 100.0}'"
-    disk_cmd = "df / | tail -n 1 | awk '{print $5}' | sed 's/%//'"
-    try:
-        cpu_usage = float(await execute_ssh_command(cpu_cmd))
-        if cpu_usage > CPU_THRESHOLD and not threshold_alerts["cpu"]:
-            threshold_alerts["cpu"] = True
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Нагрузка CPU превысила порог: {cpu_usage:.2f}% (Порог: {CPU_THRESHOLD}%)")
-        elif cpu_usage < CPU_THRESHOLD and threshold_alerts["cpu"]:
-            threshold_alerts["cpu"] = False
-        
-        ram_usage = float(await execute_ssh_command(ram_cmd))
-        if ram_usage > RAM_THRESHOLD and not threshold_alerts["ram"]:
-            threshold_alerts["ram"] = True
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Использование RAM превысило порог: {ram_usage:.2f}% (Порог: {RAM_THRESHOLD}%)")
-        elif ram_usage < RAM_THRESHOLD and threshold_alerts["ram"]:
-            threshold_alerts["ram"] = False
-        
-        disk_usage = float(await execute_ssh_command(disk_cmd))
-        if disk_usage > DISK_THRESHOLD and not threshold_alerts["disk"]:
-            threshold_alerts["disk"] = True
-            await context.bot.send_message(chat_id=ADMIN_USER_ID, text=f"📈 ВНИМАНИЕ! Место на диске превысило порог: {disk_usage:.2f}% (Порог: {DISK_THRESHOLD}%)")
-        elif disk_usage < DISK_THRESHOLD and threshold_alerts["disk"]:
-            threshold_alerts["disk"] = False
-    except (ValueError, TypeError) as e:
-        logger.error(f"Could not parse threshold values. Error: {e}")
+async def restart_service_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    service_name = context.user_data.get('service_to_restart')
+    await query.answer()
+    await query.edit_message_text(f"⏳ Перезапускаю службу `{service_name}`...", parse_mode=ParseMode.MARKDOWN)
+    output = await execute_ssh_command(f"sudo systemctl restart {service_name} && echo 'OK'")
+    text = f"✅ Служба `{service_name}` успешно перезапущена." if "OK" in output else f"❌ Не удалось перезапустить службу `{service_name}`.\n<pre>{output}</pre>"
+    await query.edit_message_text(text, reply_markup=get_back_keyboard('open_management_menu'), parse_mode=ParseMode.HTML)
 
+# --- Основная функция ---
 def main():
-    """Основная функция для запуска бота."""
-    if not all([BOT_TOKEN, ADMIN_USER_ID, SSH_HOST, SSH_USER, SSH_KEY_PATH]):
-        raise ValueError("Одна или несколько критически важных переменных окружения не заданы в .env!")
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Handlers
+    conv_handlers = {
+        "log": ConversationHandler(entry_points=[CallbackQueryHandler(get_log_prompt, '^get_log_prompt$')], states={GET_LOG_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_log_file)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
+        "restart": ConversationHandler(entry_points=[CallbackQueryHandler(restart_service_prompt, '^restart_service_prompt$')], states={RESTART_SERVICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, restart_service_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
+        "kill": ConversationHandler(entry_points=[CallbackQueryHandler(kill_process_prompt, '^kill_process_prompt$')], states={KILL_PROCESS_PID: [MessageHandler(filters.TEXT & ~filters.COMMAND, kill_process_confirm)]}, fallbacks=[CallbackQueryHandler(open_management_menu, '^open_management_menu$')]),
+    }
+    callback_handlers = {
+        '^main_menu$': main_menu,
+        '^open_management_menu$': open_management_menu,
+        '^dashboard_start$': dashboard_start,
+        '^dashboard_stop$': dashboard_stop,
+        '^get_summary$': get_server_summary,
+        '^get_network_info$': get_network_info,
+        '^run_speedtest$': run_speedtest,
+        '^get_top_processes$': get_top_processes,
+        '^restart_service_yes$': restart_service_execute,
+        '^kill_process_yes$': kill_process_execute,
+    }
     
-    # Добавляем обработчики команд
-    handlers = [
-        CommandHandler("start", start),
-        CommandHandler("ping", ping_check),
-        CommandHandler("resources", get_resources),
-        CommandHandler("disk", get_disk_space),
-        CommandHandler("info", get_server_info),
-        CommandHandler("speedtest", run_speedtest),
-        CommandHandler("restart", restart_service),
-        CommandHandler("logs", view_logs),
-        CommandHandler("netinfo", get_network_info),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_commands)
-    ]
-    application.add_handlers(handlers)
-    
-    # Настройка фоновых задач
-    job_queue = application.job_queue
-    job_queue.run_repeating(check_server_availability, interval=120, first=10) 
-    job_queue.run_repeating(check_thresholds, interval=600, first=20)
-    
-    logger.info("Bot started...")
+    application.add_handler(CommandHandler("start", start))
+    for pattern, handler in callback_handlers.items():
+        application.add_handler(CallbackQueryHandler(handler, pattern=pattern))
+    for handler in conv_handlers.values():
+        application.add_handler(handler)
+
+    logger.info("Bot started with Neofetch-style UI...")
     application.run_polling()
 
 if __name__ == "__main__":
     main()
-        
+
